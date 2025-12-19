@@ -18,6 +18,16 @@ Requirements:
 
 Usage:
     python directory_scraper.py
+
+Metadata:
+    File: Business-Directory-Scraper.py
+    Author: Jakob
+    Maintainer: Jakob
+    Email: jakob@€ichberger.tech
+    Copyright: (c) 2025 Jakob
+    License: MIT
+    Version: 0.1.0
+    Status: Development
 """
 
 from __future__ import annotations
@@ -106,6 +116,22 @@ _session = requests.Session()
 _session.headers.update(HEADERS)
 
 def fetch_html(url: str) -> Optional[str]:
+    """
+    Fetch and return the HTML content for a given URL with retry and backoff logic.
+    Performs an HTTP GET request using a shared session and retries on transient
+    failures up to `MAX_RETRIES`. If the server responds with HTTP 429 (Too Many
+    Requests), the function respects the `Retry-After` header when it is a digit;
+    otherwise it waits using exponential backoff capped at 30 seconds. For other
+    request exceptions, it retries with exponential backoff (capped at 20 seconds)
+    plus a small random jitter.
+    Args:
+        url: The URL to request.
+    Returns:
+        The response body as text (HTML) if the request succeeds; otherwise `None`
+        after all retries are exhausted.
+    Side Effects:
+        Sleeps between retries and prints an error message on permanent failure.
+    """
     last = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -184,6 +210,30 @@ def get_listing_links_playwright(start_url: str) -> List[str]:
 # Detail page parser
 # -----------------------------
 def parse_listing_html(url: str, html: str) -> ListingEntry:
+    """
+    Parse a business listing HTML page and extract key contact fields.
+    Args:
+        url: Canonical URL of the listing page (stored on the returned entry).
+        html: Raw HTML content of the listing page.
+    Returns:
+        ListingEntry: A populated entry containing:
+            - url: The input URL.
+            - name: Text from the first <h1> element (cleaned), or empty string.
+            - address: Heuristically detected street + postal/city line from page text,
+              formatted as "line_i, line_{i+1}" (cleaned), or empty string.
+            - phone: Value from the first <a href="tel:..."> (cleaned), or empty string.
+            - email: Value from the first <a href="mailto:..."> (cleaned), or empty string.
+            - website: First external absolute link (href starts with "http" and does not
+              contain BASE_URL), or empty string.
+    Notes:
+        - Uses BeautifulSoup via make_soup() to parse the HTML.
+        - Address detection scans consecutive text lines; it looks for a digit in the first
+          line and a following line matching r"^\\d{4,5}\\s+\\S+" (e.g., postal code + city).
+        - Only the first matching external website link is returned.
+    Raises:
+        Any exceptions raised by make_soup(), BeautifulSoup accessors, or regular expression
+        operations will propagate.
+    """
     soup = make_soup(html)
 
     name = _clean(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else "")
@@ -240,6 +290,23 @@ XLSX_HEADERS = [
 ]
 
 def load_or_create_workbook(path: str):
+    """
+    Load an existing Excel workbook from ``path`` or create a new one if it does not exist.
+
+    If the workbook is newly created, the active worksheet is initialized with the
+    column headers defined by the module-level ``XLSX_HEADERS`` constant.
+
+    Args:
+        path: Filesystem path to the ``.xlsx`` workbook.
+
+    Returns:
+        A tuple ``(wb, ws)`` where ``wb`` is the loaded/created ``openpyxl.Workbook``
+        and ``ws`` is the active ``openpyxl.worksheet.worksheet.Worksheet``.
+
+    Raises:
+        Any exception raised by ``openpyxl.load_workbook`` other than ``FileNotFoundError``
+        (e.g., invalid/corrupt file, permission errors).
+    """
     try:
         wb = load_workbook(path)
         ws = wb.active
@@ -275,6 +342,26 @@ def append_row(ws, row: ListingEntry):
 # Main
 # -----------------------------
 def main():
+    """
+    Orchestrate the scraping workflow and persist results to an Excel workbook.
+    This function:
+    - Loads (or creates) the output workbook/worksheet and initializes a thread lock.
+    - Reads URLs already saved in the worksheet to enable resume behavior.
+    - Collects listing URLs from `START_URL` and filters out those already processed.
+    - Concurrently fetches and parses remaining listings using a thread pool.
+    - Appends each parsed row to the worksheet in a thread-safe manner.
+    - Periodically saves progress every 25 completed listings, and saves once more at the end.
+    Side Effects:
+    - Performs network I/O to discover and fetch listings.
+    - Writes/updates `OUTPUT_XLSX` on disk.
+    Dependencies:
+    Relies on the following globals and helpers being defined:
+    `OUTPUT_XLSX`, `START_URL`, `HTTP_THREADS`,
+    `load_or_create_workbook`, `read_done_urls`, `get_listing_links_playwright`,
+    `fetch_and_parse_listing`, `append_row`.
+    Returns:
+        None
+    """
     wb, ws = load_or_create_workbook(OUTPUT_XLSX)
     lock = threading.Lock()
 
