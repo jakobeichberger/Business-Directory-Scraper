@@ -6,37 +6,44 @@ Generic scraper for business directories with paginated listings
 and individual detail pages.
 
 Features:
-- Playwright for JS-rendered listing pages (consent-safe)
+- External YAML configuration file (config.yaml)
+- Structured logging with live shell output and optional log file
+- Playwright for JS-rendered listing pages
 - Requests + BeautifulSoup for detail pages
 - Retry & rate-limit handling
 - Resume support (already scraped URLs are skipped)
 - Excel export (openpyxl)
 
 Requirements:
-    pip install requests beautifulsoup4 openpyxl playwright
+    pip install -r requirements.txt
     playwright install chromium
 
 Usage:
-    python directory_scraper.py
+    python Business-Directory-Scraper.py
+    python Business-Directory-Scraper.py --config my_config.yaml
+    python Business-Directory-Scraper.py --config config.yaml --log-level DEBUG
 
 Metadata:
     File: Business-Directory-Scraper.py
     Author: Jakob
     Maintainer: Jakob
-    Email: jakob@€ichberger.tech
+    Email: jakob@eichberger.tech
     Copyright: (c) 2025 Jakob
     License: MIT
-    Version: 0.1.0
+    Version: 0.2.0
     Status: Development
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
 import re
+import sys
 import time
 import random
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Set
 from urllib.parse import urljoin
 
@@ -47,33 +54,114 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from playwright.sync_api import sync_playwright
 
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+
+# Module-level logger — configured in setup_logging()
+logger = logging.getLogger("scraper")
+
 
 # -----------------------------
-# Configuration
+# Configuration dataclass
 # -----------------------------
-BASE_URL = "https://example-directory.tld"
-START_URL = "https://example-directory.tld/listings/region"
-OUTPUT_XLSX = "business_listings.xlsx"
+@dataclass
+class Config:
+    """All tunable settings for the scraper.  Values are loaded from a YAML
+    file at runtime; see ``config.yaml`` for the canonical reference."""
 
-HTTP_THREADS = 1
-REQUEST_TIMEOUT = 25
-MAX_RETRIES = 6
+    base_url: str = "https://example-directory.tld"
+    start_url: str = "https://example-directory.tld/listings/region"
+    output_xlsx: str = "business_listings.xlsx"
 
-# Polite scraping
-SLEEP_DETAIL = (0.15, 0.45)
+    http_threads: int = 1
+    request_timeout: int = 25
+    max_retries: int = 6
+    max_listing_pages: int = 500
 
-MAX_LISTING_PAGES = 500
+    sleep_detail_min: float = 0.15
+    sleep_detail_max: float = 0.45
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
+    detail_page_pattern: str = r"^/[a-z0-9-]+_[A-Za-z0-9]+$"
 
-# Example detail page pattern:
-#   /company-name_ABC123
-DETAIL_PAGE_PATTERN = re.compile(r"^/[a-z0-9-]+_[A-Za-z0-9]+$")
+    headers: dict = field(default_factory=lambda: {
+        "User-Agent": "Mozilla/5.0 (compatible; BusinessDirectoryScraper/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+
+    log_level: str = "INFO"
+    log_file: str = ""
+
+
+def load_config(path: str) -> Config:
+    """Load a ``Config`` from a YAML file.
+
+    Unknown keys in the file are silently ignored so that adding new
+    options to ``config.yaml`` does not break older script versions.
+
+    Args:
+        path: Path to the YAML configuration file.
+
+    Returns:
+        A populated :class:`Config` instance.
+
+    Raises:
+        SystemExit: If the file cannot be read or parsed.
+    """
+    if not _HAS_YAML:
+        logger.warning("PyYAML is not installed — using built-in defaults. "
+                       "Run: pip install pyyaml")
+        return Config()
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        logger.error("Config file not found: %s", path)
+        sys.exit(1)
+    except yaml.YAMLError as exc:
+        logger.error("Failed to parse config file %s: %s", path, exc)
+        sys.exit(1)
+
+    cfg = Config()
+    for key, value in data.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
+    return cfg
+
+
+# -----------------------------
+# Logging setup
+# -----------------------------
+def setup_logging(level: str, log_file: str = "") -> None:
+    """Configure the root *scraper* logger with a console handler and an
+    optional file handler.
+
+    Args:
+        level:    Log level string (``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``).
+        log_file: If non-empty, log messages are also written to this file.
+    """
+    numeric = getattr(logging, level.upper(), logging.INFO)
+    logger.setLevel(numeric)
+
+    fmt = logging.Formatter(
+        "[%(levelname)-8s] %(asctime)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    if log_file:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.info("Logging to file: %s", log_file)
 
 
 # -----------------------------
@@ -81,6 +169,8 @@ DETAIL_PAGE_PATTERN = re.compile(r"^/[a-z0-9-]+_[A-Za-z0-9]+$")
 # -----------------------------
 @dataclass
 class ListingEntry:
+    """One scraped business listing."""
+
     url: str
     name: str = ""
     address: str = ""
@@ -95,88 +185,114 @@ class ListingEntry:
 # -----------------------------
 # Utilities
 # -----------------------------
-def _sleep(rng):
-    time.sleep(random.uniform(rng[0], rng[1]))
+def _sleep(min_s: float, max_s: float) -> None:
+    """Sleep for a random duration in [min_s, max_s] seconds."""
+    time.sleep(random.uniform(min_s, max_s))
+
 
 def make_soup(html: str) -> BeautifulSoup:
-    """Use lxml if available, fallback to html.parser."""
+    """Return a BeautifulSoup object, preferring lxml over html.parser."""
     try:
         return BeautifulSoup(html, "lxml")
     except Exception:
         return BeautifulSoup(html, "html.parser")
 
+
 def _clean(s: str) -> str:
+    """Collapse whitespace and strip a string."""
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
 # -----------------------------
 # HTTP (detail pages)
 # -----------------------------
-_session = requests.Session()
-_session.headers.update(HEADERS)
+_thread_local = threading.local()
 
-def fetch_html(url: str) -> Optional[str]:
+
+def _get_session(headers: dict) -> requests.Session:
+    """Return (or create) a :class:`requests.Session` for the current thread.
+
+    Using thread-local storage ensures that each worker thread in the pool
+    has its own session, avoiding race conditions on shared session state
+    (cookies, adapters, etc.) while still reusing connections within a thread.
     """
-    Fetch and return the HTML content for a given URL with retry and backoff logic.
-    Performs an HTTP GET request using a shared session and retries on transient
-    failures up to `MAX_RETRIES`. If the server responds with HTTP 429 (Too Many
-    Requests), the function respects the `Retry-After` header when it is a digit;
-    otherwise it waits using exponential backoff capped at 30 seconds. For other
-    request exceptions, it retries with exponential backoff (capped at 20 seconds)
-    plus a small random jitter.
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        session.headers.update(headers)
+        _thread_local.session = session
+    return _thread_local.session
+
+
+def fetch_html(url: str, cfg: Config) -> Optional[str]:
+    """Fetch and return HTML for *url* with retry / back-off logic.
+
+    Retries up to ``cfg.max_retries`` times.  On HTTP 429 the ``Retry-After``
+    header is respected; for other errors exponential back-off with jitter is
+    used.  Uses a thread-local :class:`requests.Session` so that concurrent
+    workers do not share session state.
+
     Args:
-        url: The URL to request.
+        url: Target URL.
+        cfg: Active :class:`Config`.
+
     Returns:
-        The response body as text (HTML) if the request succeeds; otherwise `None`
-        after all retries are exhausted.
-    Side Effects:
-        Sleeps between retries and prints an error message on permanent failure.
+        Response body as text, or ``None`` if all retries are exhausted.
     """
-    last = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    session = _get_session(cfg.headers)
+    last_exc = None
+    for attempt in range(1, cfg.max_retries + 1):
         try:
-            r = _session.get(url, timeout=REQUEST_TIMEOUT)
+            r = session.get(url, timeout=cfg.request_timeout)
 
             if r.status_code == 429:
-                retry_after = r.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 30)
+                retry_after = r.headers.get("Retry-After", "")
+                wait = float(retry_after) if retry_after.isdigit() else min(2 ** attempt, 30)
+                logger.warning("Rate-limited (429) on %s — waiting %.1fs", url, wait)
                 time.sleep(wait)
                 continue
 
             r.raise_for_status()
             return r.text
 
-        except requests.RequestException as e:
-            last = e
+        except requests.RequestException as exc:
+            last_exc = exc
             backoff = min(2 ** attempt, 20) + random.uniform(0, 1.0)
+            logger.debug("Attempt %d/%d failed for %s: %s — retrying in %.1fs",
+                         attempt, cfg.max_retries, url, exc, backoff)
             time.sleep(backoff)
 
-    print(f"[ERROR] Failed permanently: {url} -> {last}")
+    logger.error("Permanently failed: %s — %s", url, last_exc)
     return None
 
 
 # -----------------------------
 # Listing pages (Playwright)
 # -----------------------------
-def get_listing_links_playwright(start_url: str) -> List[str]:
-    """
-    Collect detail page URLs from paginated listing pages using Playwright.
+def get_listing_links_playwright(cfg: Config) -> List[str]:
+    """Collect detail-page URLs from paginated listing pages using Playwright.
 
-    - Navigates listing pages: page 1 at `start_url`, then `f"{start_url}/{i}"`.
-    - Extracts <a href="..."> links matching DETAIL_PAGE_PATTERN.
-    - Returns unique absolute URLs (joined against BASE_URL).
+    Navigates pages 1 … ``cfg.max_listing_pages`` and extracts ``<a href>``
+    links that match ``cfg.detail_page_pattern``.  Stops early when a page
+    yields no new links.
+
+    Args:
+        cfg: Active :class:`Config`.
+
+    Returns:
+        Ordered list of unique absolute detail-page URLs.
     """
+    pattern = re.compile(cfg.detail_page_pattern)
     links: List[str] = []
     seen: Set[str] = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.set_default_timeout(30000)
+        page.set_default_timeout(30_000)
 
-        for i in range(1, MAX_LISTING_PAGES + 1):
-            url = start_url if i == 1 else f"{start_url}/{i}"
-            print(f"[LIST] Loading {url}")
+        for i in range(1, cfg.max_listing_pages + 1):
+            url = cfg.start_url if i == 1 else f"{cfg.start_url}/{i}"
+            logger.info("[LIST] Page %d — loading %s", i, url)
 
             page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(800)
@@ -186,61 +302,55 @@ def get_listing_links_playwright(start_url: str) -> List[str]:
 
             for a in soup.select("a[href]"):
                 href = (a.get("href") or "").strip()
-                if DETAIL_PAGE_PATTERN.match(href):
-                    page_links.append(urljoin(BASE_URL, href))
+                if pattern.match(href):
+                    page_links.append(urljoin(cfg.base_url, href))
 
             # de-dupe while preserving order
             page_links = list(dict.fromkeys(page_links))
 
             if not page_links:
+                logger.info("[LIST] No links found on page %d — stopping", i)
                 break
 
-            for u in page_links:
-                if u not in seen:
-                    seen.add(u)
-                    links.append(u)
+            new = [u for u in page_links if u not in seen]
+            seen.update(new)
+            links.extend(new)
 
-            print(f"[LIST] Page {i}: total links {len(links)}")
+            logger.info("[LIST] Page %d: +%d new links (total: %d)", i, len(new), len(links))
 
         browser.close()
 
     return links
 
+
 # -----------------------------
 # Detail page parser
 # -----------------------------
-def parse_listing_html(url: str, html: str) -> ListingEntry:
-    """
-    Parse a business listing HTML page and extract key contact fields.
+def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
+    """Parse a business listing HTML page and extract key contact fields.
+
+    Extraction strategy:
+    - **name**: text of the first ``<h1>`` element.
+    - **email**: ``href`` of the first ``<a href="mailto:…">`` link.
+    - **phone**: ``href`` of the first ``<a href="tel:…">`` link.
+    - **website**: first external ``http`` link not containing ``cfg.base_url``.
+    - **address**: heuristic scan — looks for a line containing a digit
+      followed by a line matching ``^\\d{4,5}\\s+\\S+`` (postal code + city).
+
     Args:
-        url: Canonical URL of the listing page (stored on the returned entry).
-        html: Raw HTML content of the listing page.
+        url:  Canonical URL of the page (stored on the returned entry).
+        html: Raw HTML of the page.
+        cfg:  Active :class:`Config` (used for ``base_url``).
+
     Returns:
-        ListingEntry: A populated entry containing:
-            - url: The input URL.
-            - name: Text from the first <h1> element (cleaned), or empty string.
-            - address: Heuristically detected street + postal/city line from page text,
-              formatted as "line_i, line_{i+1}" (cleaned), or empty string.
-            - phone: Value from the first <a href="tel:..."> (cleaned), or empty string.
-            - email: Value from the first <a href="mailto:..."> (cleaned), or empty string.
-            - website: First external absolute link (href starts with "http" and does not
-              contain BASE_URL), or empty string.
-    Notes:
-        - Uses BeautifulSoup via make_soup() to parse the HTML.
-        - Address detection scans consecutive text lines; it looks for a digit in the first
-          line and a following line matching r"^\\d{4,5}\\s+\\S+" (e.g., postal code + city).
-        - Only the first matching external website link is returned.
-    Raises:
-        Any exceptions raised by make_soup(), BeautifulSoup accessors, or regular expression
-        operations will propagate.
+        Populated :class:`ListingEntry`.
     """
     soup = make_soup(html)
 
-    name = _clean(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else "")
+    h1 = soup.select_one("h1")
+    name = _clean(h1.get_text(" ", strip=True)) if h1 else ""
 
-    email = ""
-    phone = ""
-    website = ""
+    email = phone = website = address = ""
 
     a_mail = soup.select_one("a[href^='mailto:']")
     if a_mail:
@@ -252,14 +362,11 @@ def parse_listing_html(url: str, html: str) -> ListingEntry:
 
     for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if href.startswith("http") and BASE_URL not in href:
+        if href.startswith("http") and cfg.base_url not in href:
             website = href
             break
 
-    text = soup.get_text("\n", strip=True)
-    lines = [l for l in text.splitlines() if l.strip()]
-
-    address = ""
+    lines = [ln for ln in soup.get_text("\n", strip=True).splitlines() if ln.strip()]
     for i in range(len(lines) - 1):
         if re.search(r"\d", lines[i]) and re.match(r"^\d{4,5}\s+\S+", lines[i + 1]):
             address = _clean(lines[i] + ", " + lines[i + 1])
@@ -275,10 +382,15 @@ def parse_listing_html(url: str, html: str) -> ListingEntry:
     )
 
 
-def fetch_and_parse_listing(url: str) -> Optional[ListingEntry]:
-    html = fetch_html(url)
-    _sleep(SLEEP_DETAIL)
-    return parse_listing_html(url, html) if html else None
+def fetch_and_parse_listing(url: str, cfg: Config) -> Optional[ListingEntry]:
+    """Fetch *url* and return a parsed :class:`ListingEntry`, or ``None`` on error."""
+    html = fetch_html(url, cfg)
+    _sleep(cfg.sleep_detail_min, cfg.sleep_detail_max)
+    if not html:
+        return None
+    entry = parse_listing_html(url, html, cfg)
+    logger.debug("Parsed: %s — %s", entry.name, url)
+    return entry
 
 
 # -----------------------------
@@ -286,26 +398,21 @@ def fetch_and_parse_listing(url: str) -> Optional[ListingEntry]:
 # -----------------------------
 XLSX_HEADERS = [
     "URL", "Name", "Address", "Phone", "Email", "Website",
-    "UID", "Registry Number", "Credit Reference"
+    "UID", "Registry Number", "Credit Reference",
 ]
 
-def load_or_create_workbook(path: str):
-    """
-    Load an existing Excel workbook from ``path`` or create a new one if it does not exist.
 
-    If the workbook is newly created, the active worksheet is initialized with the
-    column headers defined by the module-level ``XLSX_HEADERS`` constant.
+def load_or_create_workbook(path: str):
+    """Load an existing workbook from *path* or create a new one with headers.
 
     Args:
-        path: Filesystem path to the ``.xlsx`` workbook.
+        path: Filesystem path to the ``.xlsx`` file.
 
     Returns:
-        A tuple ``(wb, ws)`` where ``wb`` is the loaded/created ``openpyxl.Workbook``
-        and ``ws`` is the active ``openpyxl.worksheet.worksheet.Worksheet``.
+        Tuple ``(wb, ws)`` — the workbook and its active worksheet.
 
     Raises:
-        Any exception raised by ``openpyxl.load_workbook`` other than ``FileNotFoundError``
-        (e.g., invalid/corrupt file, permission errors).
+        Any :mod:`openpyxl` exception other than :exc:`FileNotFoundError`.
     """
     try:
         wb = load_workbook(path)
@@ -317,14 +424,18 @@ def load_or_create_workbook(path: str):
         ws.append(XLSX_HEADERS)
         return wb, ws
 
+
 def read_done_urls(ws) -> Set[str]:
+    """Return the set of URLs already present in the worksheet (column A)."""
     return {
         ws.cell(row=r, column=1).value
         for r in range(2, ws.max_row + 1)
         if isinstance(ws.cell(row=r, column=1).value, str)
     }
 
-def append_row(ws, row: ListingEntry):
+
+def append_row(ws, row: ListingEntry) -> None:
+    """Append one :class:`ListingEntry` as a new row in the worksheet."""
     ws.append([
         row.url,
         row.name,
@@ -341,52 +452,95 @@ def append_row(ws, row: ListingEntry):
 # -----------------------------
 # Main
 # -----------------------------
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Business Directory Scraper — scrapes listings to Excel",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        metavar="FILE",
+        help="Path to the YAML configuration file",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=None,
+        metavar="LEVEL",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Override the log level from the config file",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Orchestrate the full scraping workflow.
+
+    1. Parse CLI arguments and load the YAML config.
+    2. Configure logging (console + optional file).
+    3. Load or create the output Excel workbook.
+    4. Collect listing URLs via Playwright (skipping already-done ones).
+    5. Fetch and parse each detail page concurrently.
+    6. Append results to the workbook, saving every 25 rows and at the end.
     """
-    Orchestrate the scraping workflow and persist results to an Excel workbook.
-    This function:
-    - Loads (or creates) the output workbook/worksheet and initializes a thread lock.
-    - Reads URLs already saved in the worksheet to enable resume behavior.
-    - Collects listing URLs from `START_URL` and filters out those already processed.
-    - Concurrently fetches and parses remaining listings using a thread pool.
-    - Appends each parsed row to the worksheet in a thread-safe manner.
-    - Periodically saves progress every 25 completed listings, and saves once more at the end.
-    Side Effects:
-    - Performs network I/O to discover and fetch listings.
-    - Writes/updates `OUTPUT_XLSX` on disk.
-    Dependencies:
-    Relies on the following globals and helpers being defined:
-    `OUTPUT_XLSX`, `START_URL`, `HTTP_THREADS`,
-    `load_or_create_workbook`, `read_done_urls`, `get_listing_links_playwright`,
-    `fetch_and_parse_listing`, `append_row`.
-    Returns:
-        None
-    """
-    wb, ws = load_or_create_workbook(OUTPUT_XLSX)
+    args = parse_args()
+
+    # Bootstrap logging early so config-load errors are visible
+    setup_logging("INFO")
+
+    cfg = load_config(args.config)
+
+    # CLI --log-level overrides the config file value
+    if args.log_level:
+        cfg.log_level = args.log_level
+
+    # Re-configure logging with the final level and optional file
+    logger.handlers.clear()
+    setup_logging(cfg.log_level, cfg.log_file)
+
+    logger.info("Config loaded from: %s", args.config)
+    logger.info("Output file: %s", cfg.output_xlsx)
+
+    wb, ws = load_or_create_workbook(cfg.output_xlsx)
     lock = threading.Lock()
 
     done_urls = read_done_urls(ws)
-    print(f"[INFO] Resume enabled ({len(done_urls)} entries already saved)")
+    logger.info("Resume: %d entries already saved", len(done_urls))
 
-    links = get_listing_links_playwright(START_URL)
+    links = get_listing_links_playwright(cfg)
     todo = [u for u in links if u not in done_urls]
+    logger.info("Listings discovered: %d total, %d pending", len(links), len(todo))
 
-    with ThreadPoolExecutor(max_workers=HTTP_THREADS) as pool:
-        futures = [pool.submit(fetch_and_parse_listing, url) for url in todo]
+    if not todo:
+        logger.info("Nothing to do — all listings already scraped.")
+        return
 
-        for i, f in enumerate(as_completed(futures), 1):
-            row = f.result()
+    completed = 0
+    total = len(todo)
+
+    with ThreadPoolExecutor(max_workers=cfg.http_threads) as pool:
+        futures = {pool.submit(fetch_and_parse_listing, url, cfg): url
+                   for url in todo}
+
+        for future in as_completed(futures):
+            completed += 1
+            row = future.result()
             if not row:
+                logger.warning("[%d/%d] Failed: %s", completed, total, futures[future])
                 continue
 
             with lock:
                 append_row(ws, row)
 
-            if i % 25 == 0:
-                wb.save(OUTPUT_XLSX)
+            logger.info("[%d/%d] Saved: %s", completed, total, row.name or futures[future])
 
-    wb.save(OUTPUT_XLSX)
-    print(f"[DONE] Finished. Output: {OUTPUT_XLSX}")
+            if completed % 25 == 0:
+                with lock:
+                    wb.save(cfg.output_xlsx)
+                logger.debug("Progress checkpoint saved (%d rows)", completed)
+
+    wb.save(cfg.output_xlsx)
+    logger.info("Done — %d listings written to %s", completed, cfg.output_xlsx)
 
 
 if __name__ == "__main__":

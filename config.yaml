@@ -1,0 +1,51 @@
+# ============================================================
+# Business Directory Scraper — Configuration File
+# ============================================================
+# Copy this file and edit it to match the target directory.
+# Pass a custom config with:  python Business-Directory-Scraper.py --config my_config.yaml
+
+# ------------------------------------------------------------
+# Target website
+# ------------------------------------------------------------
+base_url: "https://example-directory.tld"
+start_url: "https://example-directory.tld/listings/region"
+
+# ------------------------------------------------------------
+# Output
+# ------------------------------------------------------------
+output_xlsx: "business_listings.xlsx"
+
+# ------------------------------------------------------------
+# Performance
+# ------------------------------------------------------------
+http_threads: 1          # Parallel detail-page requests (keep low to be polite)
+request_timeout: 25      # HTTP request timeout in seconds
+max_retries: 6           # Retry attempts per failed request
+max_listing_pages: 500   # Safety cap for paginated listing pages
+
+# ------------------------------------------------------------
+# Politeness — random delay between detail-page requests
+# ------------------------------------------------------------
+sleep_detail_min: 0.15   # Minimum sleep in seconds
+sleep_detail_max: 0.45   # Maximum sleep in seconds
+
+# ------------------------------------------------------------
+# URL pattern — adjust to match the target directory's URL scheme
+# Example:  /company-name_ABC123
+# ------------------------------------------------------------
+detail_page_pattern: "^/[a-z0-9-]+_[A-Za-z0-9]+$"
+
+# ------------------------------------------------------------
+# HTTP request headers
+# ------------------------------------------------------------
+headers:
+  User-Agent: "Mozilla/5.0 (compatible; BusinessDirectoryScraper/1.0)"
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+  Accept-Language: "en-US,en;q=0.9"
+  Connection: "keep-alive"
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+log_level: "INFO"        # DEBUG | INFO | WARNING | ERROR
+log_file: ""             # Leave empty to log to console only; set a path to also write a file
