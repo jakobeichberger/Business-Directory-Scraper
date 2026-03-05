@@ -15,6 +15,9 @@ start_url: "https://example-directory.tld/listings/region"
 # ------------------------------------------------------------
 output_xlsx: "business_listings.xlsx"
 
+# Optional: also export a CSV file (leave empty to disable)
+output_csv: ""   # e.g. "business_listings.csv"
+
 # ------------------------------------------------------------
 # Performance
 # ------------------------------------------------------------
@@ -22,6 +25,9 @@ http_threads: 1          # Parallel detail-page requests (keep low to be polite)
 request_timeout: 25      # HTTP request timeout in seconds
 max_retries: 6           # Retry attempts per failed request
 max_listing_pages: 500   # Safety cap for paginated listing pages
+
+# Milliseconds Playwright waits after page load before reading the DOM
+playwright_wait_ms: 800
 
 # ------------------------------------------------------------
 # Politeness — random delay between detail-page requests
@@ -34,6 +40,29 @@ sleep_detail_max: 0.45   # Maximum sleep in seconds
 # Example:  /company-name_ABC123
 # ------------------------------------------------------------
 detail_page_pattern: "^/[a-z0-9-]+_[A-Za-z0-9]+$"
+
+# ------------------------------------------------------------
+# CSS field selectors — customise per site without editing Python
+#
+# Each value is a CSS selector passed to BeautifulSoup's select_one().
+# Leave "address" empty to use the built-in heuristic (postal-code line).
+# ------------------------------------------------------------
+field_selectors:
+  name:    "h1"
+  email:   "a[href^='mailto:']"
+  phone:   "a[href^='tel:']"
+  website: "a[href^='http']"
+  address: ""   # e.g. ".vcard .adr"  — leave empty for built-in heuristic
+
+# ------------------------------------------------------------
+# Missing-data enrichment via DuckDuckGo (optional)
+#
+# When true, entries with missing phone/email/website are submitted
+# to the DuckDuckGo Instant Answer API.  No API key is required.
+# Enable cautiously: adds extra HTTP requests and may not always
+# find accurate results.
+# ------------------------------------------------------------
+enrich_missing_data: false
 
 # ------------------------------------------------------------
 # HTTP request headers
