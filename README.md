@@ -8,6 +8,62 @@ It is intentionally kept generic so it can be adapted to different directory pla
 
 ---
 
+## How It Works
+
+### Scraping Pipeline
+
+```mermaid
+flowchart TD
+    A([config.yaml]) --> B[Load Config & CLI args]
+    B --> C[Resume: load existing Excel]
+    C --> D[["Playwright\n(headless Chromium)\nCollect listing URLs"]]
+    D --> E{More pages?}
+    E -- yes --> F[Navigate to next page]
+    F --> G[Extract detail-page hrefs]
+    G --> E
+    E -- no --> H[Filter already-scraped URLs]
+    H --> I[["Thread Pool\nhttp_threads workers"]]
+    I --> J[["Requests + BeautifulSoup\nFetch & parse each detail page"]]
+    J --> K[(Excel .xlsx\nappend row)]
+    K --> L{every 25 rows?}
+    L -- yes --> M[Save checkpoint]
+    M --> I
+    L -- no --> I
+    I --> N([Done ✓])
+```
+
+### Architecture Overview
+
+```mermaid
+flowchart LR
+    subgraph inputs [" Inputs "]
+        CFG[config.yaml]
+        CLI[CLI args\n--config\n--log-level]
+    end
+
+    subgraph scraper [" Scraper "]
+        direction TB
+        PW["🌐 Playwright\nJS-rendered listing pages"]
+        TP["⚡ Thread Pool\nParallel detail fetches"]
+        RQ["🔍 Requests + BeautifulSoup\nDetail page parser"]
+        PW -- "detail-page URLs" --> TP
+        TP --> RQ
+    end
+
+    subgraph outputs [" Outputs "]
+        XL["📊 Excel file\n(URL, Name, Address,\nPhone, Email, Website …)"]
+        LOG["📄 Log file\n(optional)"]
+    end
+
+    WEB["🏢 Directory\nWebsite"] -- "paginated listing pages" --> PW
+    WEB -- "business detail pages" --> RQ
+    inputs --> scraper
+    RQ -- "parsed entries" --> XL
+    scraper -- "structured log lines" --> LOG
+```
+
+---
+
 ## Features
 
 - **External configuration** — all settings in a single `config.yaml` file
