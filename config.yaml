@@ -15,6 +15,10 @@ start_url: "https://example-directory.tld/listings/region"
 # ------------------------------------------------------------
 output_xlsx: "business_listings.xlsx"
 
+# Output format: "xlsx" | "csv" | "both"
+# "both" writes an Excel file (with resume support) AND a CSV file.
+output_format: "xlsx"
+
 # ------------------------------------------------------------
 # Performance
 # ------------------------------------------------------------
@@ -34,6 +38,25 @@ sleep_detail_max: 0.45   # Maximum sleep in seconds
 # Example:  /company-name_ABC123
 # ------------------------------------------------------------
 detail_page_pattern: "^/[a-z0-9-]+_[A-Za-z0-9]+$"
+
+# ------------------------------------------------------------
+# CSS selectors for data extraction
+# Leave a value empty ("") to use the built-in heuristic for that field.
+# Override only the fields that differ from the defaults for your target site.
+# ------------------------------------------------------------
+selectors:
+  name:    "h1"                    # CSS selector for the business name element
+  email:   "a[href^='mailto:']"    # CSS selector for the email link
+  phone:   "a[href^='tel:']"       # CSS selector for the phone link
+  website: ""                      # CSS selector for the website link; empty → first external http link
+  address: ""                      # CSS selector for the address block; empty → postal-code heuristic
+
+# ------------------------------------------------------------
+# Missing-data enrichment
+# When true, a DuckDuckGo web search is performed for entries that are
+# missing email, phone, or website. Requires: pip install duckduckgo-search
+# ------------------------------------------------------------
+enrich_missing_data: false
 
 # ------------------------------------------------------------
 # HTTP request headers

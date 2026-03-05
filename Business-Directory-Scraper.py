@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Business Directory Scraper -> Excel
+Business Directory Scraper -> Excel / CSV
 
 Generic scraper for business directories with paginated listings
 and individual detail pages.
@@ -12,7 +12,11 @@ Features:
 - Requests + BeautifulSoup for detail pages
 - Retry & rate-limit handling
 - Resume support (already scraped URLs are skipped)
-- Excel export (openpyxl)
+- Excel export (openpyxl) and/or CSV export
+- Configurable CSS selectors — no Python editing required
+- Data cleaning and normalisation (phone, email, website, address)
+- Missing-field tracking (scraped_at timestamp + missing_fields column)
+- Optional DuckDuckGo web search to enrich entries with missing contact data
 
 Requirements:
     pip install -r requirements.txt
@@ -30,13 +34,14 @@ Metadata:
     Email: jakob@eichberger.tech
     Copyright: (c) 2025 Jakob
     License: MIT
-    Version: 0.2.0
+    Version: 0.3.0
     Status: Development
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import re
 import sys
@@ -44,8 +49,10 @@ import time
 import random
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List, Set
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -59,6 +66,12 @@ try:
     _HAS_YAML = True
 except ImportError:
     _HAS_YAML = False
+
+try:
+    from duckduckgo_search import DDGS
+    _HAS_DDGS = True
+except ImportError:
+    _HAS_DDGS = False
 
 # Module-level logger — configured in setup_logging()
 logger = logging.getLogger("scraper")
@@ -76,6 +89,9 @@ class Config:
     start_url: str = "https://example-directory.tld/listings/region"
     output_xlsx: str = "business_listings.xlsx"
 
+    # Output format: "xlsx", "csv", or "both"
+    output_format: str = "xlsx"
+
     http_threads: int = 1
     request_timeout: int = 25
     max_retries: int = 6
@@ -85,6 +101,18 @@ class Config:
     sleep_detail_max: float = 0.45
 
     detail_page_pattern: str = r"^/[a-z0-9-]+_[A-Za-z0-9]+$"
+
+    # CSS selectors for data extraction — set to "" to use the built-in heuristic
+    selectors: dict = field(default_factory=lambda: {
+        "name": "h1",
+        "email": "a[href^='mailto:']",
+        "phone": "a[href^='tel:']",
+        "website": "",   # empty → first external http link
+        "address": "",   # empty → heuristic postal-code scan
+    })
+
+    # Set to true to search DuckDuckGo for missing contact data (requires duckduckgo-search)
+    enrich_missing_data: bool = False
 
     headers: dict = field(default_factory=lambda: {
         "User-Agent": "Mozilla/5.0 (compatible; BusinessDirectoryScraper/1.0)",
@@ -102,6 +130,8 @@ def load_config(path: str) -> Config:
 
     Unknown keys in the file are silently ignored so that adding new
     options to ``config.yaml`` does not break older script versions.
+    The ``selectors`` key is merged with the defaults so that users only
+    need to override the selectors they care about.
 
     Args:
         path: Path to the YAML configuration file.
@@ -129,7 +159,14 @@ def load_config(path: str) -> Config:
 
     cfg = Config()
     for key, value in data.items():
-        if hasattr(cfg, key):
+        if not hasattr(cfg, key):
+            continue
+        # Merge nested dicts (e.g. selectors, headers) rather than replacing them
+        if isinstance(value, dict) and isinstance(getattr(cfg, key), dict):
+            merged = dict(getattr(cfg, key))
+            merged.update(value)
+            setattr(cfg, key, merged)
+        else:
             setattr(cfg, key, value)
     return cfg
 
@@ -180,6 +217,19 @@ class ListingEntry:
     uid: str = ""
     registry_number: str = ""
     credit_reference: str = ""
+    scraped_at: str = ""
+    missing_fields: str = ""
+
+    def compute_missing(self) -> None:
+        """Populate ``missing_fields`` with a comma-separated list of core
+        fields that are empty, and set ``scraped_at`` to the current UTC time
+        if it has not been set yet.
+        """
+        core_fields = ("name", "address", "phone", "email", "website")
+        missing = [f for f in core_fields if not getattr(self, f)]
+        self.missing_fields = ", ".join(missing) if missing else ""
+        if not self.scraped_at:
+            self.scraped_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # -----------------------------
@@ -201,6 +251,52 @@ def make_soup(html: str) -> BeautifulSoup:
 def _clean(s: str) -> str:
     """Collapse whitespace and strip a string."""
     return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+# --- Data-cleaning helpers ---
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def clean_phone(phone: str) -> str:
+    """Normalise a phone number string.
+
+    Strips leading/trailing whitespace and collapses internal whitespace.
+    Removes any ``tel:`` prefix left over from an ``<a href>`` attribute.
+    """
+    phone = _clean(re.sub(r"^tel:", "", phone.strip(), flags=re.IGNORECASE))
+    # Collapse multiple spaces within the number
+    phone = re.sub(r"[\s]+", " ", phone)
+    return phone
+
+
+def clean_email(email: str) -> str:
+    """Normalise and validate an email address string.
+
+    Strips whitespace and lower-cases the address.  Returns an empty string
+    if the result does not match a basic ``user@domain.tld`` pattern so that
+    obviously invalid values are not written to the output.
+    """
+    email = _clean(re.sub(r"^mailto:", "", email.strip(), flags=re.IGNORECASE)).lower()
+    return email if _EMAIL_RE.match(email) else ""
+
+
+def clean_website(website: str) -> str:
+    """Normalise a website URL.
+
+    Strips whitespace.  If the URL has no scheme it is assumed to be
+    ``https``.  Returns an empty string for non-HTTP(S) values.
+    """
+    website = _clean(website)
+    if not website:
+        return ""
+    parsed = urlparse(website)
+    if not parsed.scheme:
+        website = "https://" + website
+        parsed = urlparse(website)
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    return website
 
 
 # -----------------------------
@@ -329,50 +425,81 @@ def get_listing_links_playwright(cfg: Config) -> List[str]:
 def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
     """Parse a business listing HTML page and extract key contact fields.
 
-    Extraction strategy:
-    - **name**: text of the first ``<h1>`` element.
-    - **email**: ``href`` of the first ``<a href="mailto:…">`` link.
-    - **phone**: ``href`` of the first ``<a href="tel:…">`` link.
-    - **website**: first external ``http`` link not containing ``cfg.base_url``.
-    - **address**: heuristic scan — looks for a line containing a digit
-      followed by a line matching ``^\\d{4,5}\\s+\\S+`` (postal code + city).
+    Extraction uses CSS selectors from ``cfg.selectors`` where provided,
+    falling back to built-in heuristics when a selector is empty.
+
+    Selector keys and their default heuristics:
+
+    - **name**: text of the element matched by ``selectors.name`` (default: ``h1``).
+    - **email**: ``href`` attribute of ``selectors.email``
+      (default: first ``<a href="mailto:…">``).
+    - **phone**: ``href`` attribute of ``selectors.phone``
+      (default: first ``<a href="tel:…">``).
+    - **website**: ``href`` of ``selectors.website``
+      (default: first external ``http`` link not on ``cfg.base_url``).
+    - **address**: text of ``selectors.address``
+      (default: heuristic postal-code scan — a line containing a digit
+      followed by a line matching ``^\\d{4,5}\\s+\\S+``).
+
+    All extracted values are cleaned and normalised before being stored.
 
     Args:
         url:  Canonical URL of the page (stored on the returned entry).
         html: Raw HTML of the page.
-        cfg:  Active :class:`Config` (used for ``base_url``).
+        cfg:  Active :class:`Config` (used for ``base_url`` and ``selectors``).
 
     Returns:
-        Populated :class:`ListingEntry`.
+        Populated :class:`ListingEntry` with ``scraped_at`` and
+        ``missing_fields`` already computed.
     """
     soup = make_soup(html)
+    sel = cfg.selectors
 
-    h1 = soup.select_one("h1")
-    name = _clean(h1.get_text(" ", strip=True)) if h1 else ""
+    # --- name ---
+    name_selector = sel.get("name") or "h1"
+    name_el = soup.select_one(name_selector)
+    name = _clean(name_el.get_text(" ", strip=True)) if name_el else ""
 
-    email = phone = website = address = ""
+    # --- email ---
+    email_selector = sel.get("email") or "a[href^='mailto:']"
+    a_mail = soup.select_one(email_selector)
+    email = clean_email(a_mail["href"]) if a_mail and a_mail.get("href") else ""
 
-    a_mail = soup.select_one("a[href^='mailto:']")
-    if a_mail:
-        email = _clean(a_mail["href"].replace("mailto:", ""))
+    # --- phone ---
+    phone_selector = sel.get("phone") or "a[href^='tel:']"
+    a_tel = soup.select_one(phone_selector)
+    phone = clean_phone(a_tel["href"]) if a_tel and a_tel.get("href") else ""
 
-    a_tel = soup.select_one("a[href^='tel:']")
-    if a_tel:
-        phone = _clean(a_tel["href"].replace("tel:", ""))
+    # --- website ---
+    website = ""
+    website_selector = sel.get("website", "")
+    if website_selector:
+        ws_el = soup.select_one(website_selector)
+        if ws_el and ws_el.get("href"):
+            website = clean_website(ws_el["href"])
+    else:
+        for a in soup.select("a[href]"):
+            href = a.get("href", "")
+            if href.startswith("http") and cfg.base_url not in href:
+                website = clean_website(href)
+                if website:
+                    break
 
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        if href.startswith("http") and cfg.base_url not in href:
-            website = href
-            break
+    # --- address ---
+    address = ""
+    address_selector = sel.get("address", "")
+    if address_selector:
+        addr_el = soup.select_one(address_selector)
+        if addr_el:
+            address = _clean(addr_el.get_text(" ", strip=True))
+    else:
+        lines = [ln for ln in soup.get_text("\n", strip=True).splitlines() if ln.strip()]
+        for i in range(len(lines) - 1):
+            if re.search(r"\d", lines[i]) and re.match(r"^\d{4,5}\s+\S+", lines[i + 1]):
+                address = _clean(lines[i] + ", " + lines[i + 1])
+                break
 
-    lines = [ln for ln in soup.get_text("\n", strip=True).splitlines() if ln.strip()]
-    for i in range(len(lines) - 1):
-        if re.search(r"\d", lines[i]) and re.match(r"^\d{4,5}\s+\S+", lines[i + 1]):
-            address = _clean(lines[i] + ", " + lines[i + 1])
-            break
-
-    return ListingEntry(
+    entry = ListingEntry(
         url=url,
         name=name,
         address=address,
@@ -380,17 +507,107 @@ def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
         email=email,
         website=website,
     )
+    entry.compute_missing()
+    return entry
 
 
 def fetch_and_parse_listing(url: str, cfg: Config) -> Optional[ListingEntry]:
-    """Fetch *url* and return a parsed :class:`ListingEntry`, or ``None`` on error."""
+    """Fetch *url* and return a parsed :class:`ListingEntry`, or ``None`` on error.
+
+    If ``cfg.enrich_missing_data`` is ``True`` and the ``duckduckgo-search``
+    package is available, a DuckDuckGo search is performed for any missing
+    contact fields (email, phone, website) using the business name as the
+    query.
+    """
     html = fetch_html(url, cfg)
     _sleep(cfg.sleep_detail_min, cfg.sleep_detail_max)
     if not html:
         return None
     entry = parse_listing_html(url, html, cfg)
+    if cfg.enrich_missing_data:
+        enrich_entry(entry, cfg)
     logger.debug("Parsed: %s — %s", entry.name, url)
     return entry
+
+
+# -----------------------------
+# DuckDuckGo enrichment
+# -----------------------------
+def enrich_entry(entry: ListingEntry, cfg: Config) -> None:
+    """Search DuckDuckGo for any missing contact fields on *entry*.
+
+    Only runs when the ``duckduckgo-search`` package is installed.  Searches
+    for ``"<name>" contact email`` (or phone/website depending on which fields
+    are missing) and attempts to extract the relevant data from the first few
+    search results.
+
+    The entry's ``missing_fields`` list is recomputed after enrichment.
+
+    Args:
+        entry: The :class:`ListingEntry` to enrich in place.
+        cfg:   Active :class:`Config` (used to log a warning if the package
+               is unavailable).
+    """
+    if not _HAS_DDGS:
+        logger.warning(
+            "enrich_missing_data is enabled but duckduckgo-search is not installed. "
+            "Run: pip install duckduckgo-search"
+        )
+        return
+
+    if not entry.name:
+        return
+
+    missing = [f for f in ("email", "phone", "website") if not getattr(entry, f)]
+    if not missing:
+        return
+
+    query = f'"{entry.name}" {entry.address or ""} contact'.strip()
+    logger.debug("Enriching [%s] via DuckDuckGo: %s", entry.name, query)
+
+    try:
+        ddgs = DDGS()
+        results = list(ddgs.text(query, max_results=5))
+    except Exception as exc:
+        logger.debug("DuckDuckGo search failed for %s: %s", entry.name, exc)
+        return
+
+    combined_text = " ".join(
+        f"{r.get('title', '')} {r.get('body', '')}" for r in results
+    )
+
+    if "email" in missing:
+        found = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", combined_text)
+        for candidate in found:
+            cleaned = clean_email(candidate)
+            if cleaned:
+                entry.email = cleaned
+                logger.debug("Enriched email for %s: %s", entry.name, cleaned)
+                break
+
+    if "website" in missing:
+        for r in results:
+            href = r.get("href", "")
+            cleaned = clean_website(href)
+            if cleaned and cfg.base_url not in cleaned:
+                entry.website = cleaned
+                logger.debug("Enriched website for %s: %s", entry.name, cleaned)
+                break
+
+    if "phone" in missing:
+        # Look for common phone number patterns in the combined search snippet text
+        found = re.findall(
+            r"(?:\+?\d[\d\s\-\(\)]{6,}\d)",
+            combined_text,
+        )
+        for candidate in found:
+            cleaned = clean_phone(candidate)
+            if len(re.sub(r"\D", "", cleaned)) >= 7:
+                entry.phone = cleaned
+                logger.debug("Enriched phone for %s: %s", entry.name, cleaned)
+                break
+
+    entry.compute_missing()
 
 
 # -----------------------------
@@ -399,6 +616,7 @@ def fetch_and_parse_listing(url: str, cfg: Config) -> Optional[ListingEntry]:
 XLSX_HEADERS = [
     "URL", "Name", "Address", "Phone", "Email", "Website",
     "UID", "Registry Number", "Credit Reference",
+    "Scraped At", "Missing Fields",
 ]
 
 
@@ -446,7 +664,43 @@ def append_row(ws, row: ListingEntry) -> None:
         row.uid,
         row.registry_number,
         row.credit_reference,
+        row.scraped_at,
+        row.missing_fields,
     ])
+
+
+# -----------------------------
+# CSV export
+# -----------------------------
+def export_csv(entries: List[ListingEntry], path: str) -> None:
+    """Write *entries* to a UTF-8 CSV file at *path*.
+
+    The file is written from scratch every time this function is called (it is
+    not resume-safe like the Excel path, but is intended as an optional
+    additional export at the end of the run).
+
+    Args:
+        entries: All scraped :class:`ListingEntry` objects.
+        path:    Filesystem path for the ``.csv`` file.
+    """
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        # utf-8-sig writes a BOM so Excel opens the file correctly on Windows
+        writer = csv.DictWriter(fh, fieldnames=XLSX_HEADERS)
+        writer.writeheader()
+        for e in entries:
+            writer.writerow({
+                "URL": e.url,
+                "Name": e.name,
+                "Address": e.address,
+                "Phone": e.phone,
+                "Email": e.email,
+                "Website": e.website,
+                "UID": e.uid,
+                "Registry Number": e.registry_number,
+                "Credit Reference": e.credit_reference,
+                "Scraped At": e.scraped_at,
+                "Missing Fields": e.missing_fields,
+            })
 
 
 # -----------------------------
@@ -481,7 +735,9 @@ def main() -> None:
     3. Load or create the output Excel workbook.
     4. Collect listing URLs via Playwright (skipping already-done ones).
     5. Fetch and parse each detail page concurrently.
-    6. Append results to the workbook, saving every 25 rows and at the end.
+    6. Optionally enrich entries with missing data via DuckDuckGo search.
+    7. Append results to the workbook, saving every 25 rows and at the end.
+    8. Optionally export a CSV file alongside the Excel file.
     """
     args = parse_args()
 
@@ -500,6 +756,13 @@ def main() -> None:
 
     logger.info("Config loaded from: %s", args.config)
     logger.info("Output file: %s", cfg.output_xlsx)
+    logger.info("Output format: %s", cfg.output_format)
+
+    if cfg.enrich_missing_data and not _HAS_DDGS:
+        logger.warning(
+            "enrich_missing_data is enabled but duckduckgo-search is not installed. "
+            "Enrichment will be skipped. Run: pip install duckduckgo-search"
+        )
 
     wb, ws = load_or_create_workbook(cfg.output_xlsx)
     lock = threading.Lock()
@@ -517,6 +780,7 @@ def main() -> None:
 
     completed = 0
     total = len(todo)
+    all_entries: List[ListingEntry] = []
 
     with ThreadPoolExecutor(max_workers=cfg.http_threads) as pool:
         futures = {pool.submit(fetch_and_parse_listing, url, cfg): url
@@ -531,8 +795,11 @@ def main() -> None:
 
             with lock:
                 append_row(ws, row)
+                all_entries.append(row)
 
-            logger.info("[%d/%d] Saved: %s", completed, total, row.name or futures[future])
+            missing_note = f" [missing: {row.missing_fields}]" if row.missing_fields else ""
+            logger.info("[%d/%d] Saved: %s%s", completed, total,
+                        row.name or futures[future], missing_note)
 
             if completed % 25 == 0:
                 with lock:
@@ -541,6 +808,11 @@ def main() -> None:
 
     wb.save(cfg.output_xlsx)
     logger.info("Done — %d listings written to %s", completed, cfg.output_xlsx)
+
+    if cfg.output_format in ("csv", "both"):
+        csv_path = str(Path(cfg.output_xlsx).with_suffix(".csv"))
+        export_csv(all_entries, csv_path)
+        logger.info("CSV export written to %s", csv_path)
 
 
 if __name__ == "__main__":
