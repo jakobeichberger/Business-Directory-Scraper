@@ -7,8 +7,8 @@
 # ------------------------------------------------------------
 # Target website
 # ------------------------------------------------------------
-base_url: "https://example-directory.tld"
-start_url: "https://example-directory.tld/listings/region"
+base_url: "https://www.firmenabc.at"
+start_url: "https://www.firmenabc.at/firmen/wiener-neustadt-stadt_Fs"
 
 # ------------------------------------------------------------
 # Output
@@ -25,9 +25,15 @@ http_threads: 1          # Parallel detail-page requests (keep low to be polite)
 request_timeout: 25      # HTTP request timeout in seconds
 max_retries: 6           # Retry attempts per failed request
 max_listing_pages: 500   # Safety cap for paginated listing pages
+save_every: 1            # Save after every row; use 25 for fewer disk writes
 
 # Milliseconds Playwright waits after page load before reading the DOM
 playwright_wait_ms: 800
+listing_timeout_ms: 30000
+
+# Stop conditions while scanning paginated listing pages
+empty_listing_page_limit: 2
+repeated_listing_page_limit: 2
 
 # ------------------------------------------------------------
 # Politeness — random delay between detail-page requests
@@ -39,7 +45,7 @@ sleep_detail_max: 0.45   # Maximum sleep in seconds
 # URL pattern — adjust to match the target directory's URL scheme
 # Example:  /company-name_ABC123
 # ------------------------------------------------------------
-detail_page_pattern: "^/[a-z0-9-]+_[A-Za-z0-9]+$"
+detail_page_pattern: "^/[^/?#]+_[A-Za-z0-9]+$"
 
 # ------------------------------------------------------------
 # CSS field selectors — customise per site without editing Python
@@ -51,7 +57,7 @@ field_selectors:
   name:    "h1"
   email:   "a[href^='mailto:']"
   phone:   "a[href^='tel:']"
-  website: "a[href^='http']"
+  website: "a[href^='http'], a[href*='url='], a[href*='website=']"
   address: ""   # e.g. ".vcard .adr"  — leave empty for built-in heuristic
 
 # ------------------------------------------------------------
@@ -65,12 +71,32 @@ field_selectors:
 enrich_missing_data: false
 
 # ------------------------------------------------------------
+# Search fallback for broken / incomplete detail pages
+#
+# When enabled, unreachable FirmenABC detail pages or low-quality rows are
+# completed via open search engines and by scanning likely company websites.
+# Direct Google scraping is intentionally not used here because it is fragile;
+# search snippets from open engines and company/contact/imprint pages are used.
+# ------------------------------------------------------------
+search_fallback_enabled: true
+search_fallback_when_quality_below: 80
+search_engines: "duckduckgo,bing"
+search_max_results: 5
+search_parallel_workers: 2       # Runs search engines in parallel, capped low
+search_request_delay: 0.75       # Global delay between search requests
+fallback_site_scan_limit: 3      # Max company-site candidates scanned per query
+fallback_site_threads: 2         # Parallel candidate company sites
+website_scan_max_pages: 5
+website_scan_threads: 2          # Parallel contact/imprint pages per company site
+website_scan_paths: "/kontakt,/kontakt/,/impressum,/impressum/,/contact,/contact/,/team,/team/,/ueber-uns,/ueber-uns/,/about,/about/"
+
+# ------------------------------------------------------------
 # HTTP request headers
 # ------------------------------------------------------------
 headers:
-  User-Agent: "Mozilla/5.0 (compatible; BusinessDirectoryScraper/1.0)"
+  User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
   Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-  Accept-Language: "en-US,en;q=0.9"
+  Accept-Language: "de-AT,de;q=0.9,en;q=0.8"
   Connection: "keep-alive"
 
 # ------------------------------------------------------------
