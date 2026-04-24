@@ -23,9 +23,7 @@ Requirements:
     playwright install chromium
 
 Usage:
-    python Business-Directory-Scraper.py
-    python Business-Directory-Scraper.py --config my_config.yaml
-    python Business-Directory-Scraper.py --config config.yaml --log-level DEBUG
+    python directory_scraper.py
 
 Metadata:
     File: Business-Directory-Scraper.py
@@ -34,7 +32,7 @@ Metadata:
     Email: jakob@eichberger.tech
     Copyright: (c) 2025 Jakob
     License: MIT
-    Version: 0.3.0
+    Version: 0.1.0
     Status: Development
 """
 
@@ -48,16 +46,18 @@ import re
 import sys
 import time
 import random
-import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional, List, Set
-from urllib.parse import urljoin, quote as urlquote
-
+import signal
+import logging
+import json
+import html as html_lib
 import requests
+import threading
+from dataclasses import dataclass
+from typing import Optional, List, Set
+from urllib.parse import urljoin
+
 from bs4 import BeautifulSoup
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import PatternFill, Font
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from playwright.sync_api import sync_playwright
@@ -75,129 +75,29 @@ logger = logging.getLogger("scraper")
 # -----------------------------
 # Configuration dataclass
 # -----------------------------
-@dataclass
-class Config:
-    """All tunable settings for the scraper.  Values are loaded from a YAML
-    file at runtime; see ``config.yaml`` for the canonical reference."""
+BASE_URL = "https://example-directory.tld"
+START_URL = "https://example-directory.tld/listings/region"
+OUTPUT_XLSX = "business_listings.xlsx"
 
-    base_url: str = "https://example-directory.tld"
-    start_url: str = "https://example-directory.tld/listings/region"
-    output_xlsx: str = "business_listings.xlsx"
-    output_csv: str = ""  # Leave empty to skip CSV output
+HTTP_THREADS = 1
+REQUEST_TIMEOUT = 25
+MAX_RETRIES = 6
 
-    http_threads: int = 1
-    request_timeout: int = 25
-    max_retries: int = 6
-    max_listing_pages: int = 500
+# Polite scraping
+SLEEP_DETAIL = (0.15, 0.45)
 
-    sleep_detail_min: float = 0.15
-    sleep_detail_max: float = 0.45
+MAX_LISTING_PAGES = 500
 
-    # Milliseconds Playwright waits after page load before reading the DOM
-    playwright_wait_ms: int = 800
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
-    detail_page_pattern: str = r"^/[a-z0-9-]+_[A-Za-z0-9]+$"
-
-    # CSS selectors used by parse_listing_html() — customise per site without
-    # touching the Python source.
-    field_selectors: dict = field(default_factory=lambda: {
-        "name":    "h1",
-        "email":   "a[href^='mailto:']",
-        "phone":   "a[href^='tel:']",
-        "website": "a[href^='http']",
-        "address": "",   # leave empty to use the built-in heuristic
-    })
-
-    headers: dict = field(default_factory=lambda: {
-        "User-Agent": "Mozilla/5.0 (compatible; BusinessDirectoryScraper/1.0)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    })
-
-    log_level: str = "INFO"
-    log_file: str = ""
-
-    # When True, use DuckDuckGo to attempt to fill in missing contact fields
-    enrich_missing_data: bool = False
-
-
-def load_config(path: str) -> Config:
-    """Load a ``Config`` from a YAML file.
-
-    Unknown keys in the file are silently ignored so that adding new
-    options to ``config.yaml`` does not break older script versions.
-    Nested dict keys (e.g. ``field_selectors``, ``headers``) are merged
-    rather than replaced so that users only need to specify the keys they
-    want to override.
-
-    Args:
-        path: Path to the YAML configuration file.
-
-    Returns:
-        A populated :class:`Config` instance.
-
-    Raises:
-        SystemExit: If the file cannot be read or parsed.
-    """
-    if not _HAS_YAML:
-        logger.warning("PyYAML is not installed — using built-in defaults. "
-                       "Run: pip install pyyaml")
-        return Config()
-
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        logger.error("Config file not found: %s", path)
-        sys.exit(1)
-    except yaml.YAMLError as exc:
-        logger.error("Failed to parse config file %s: %s", path, exc)
-        sys.exit(1)
-
-    cfg = Config()
-    for key, value in data.items():
-        if not hasattr(cfg, key):
-            continue
-        existing = getattr(cfg, key)
-        if isinstance(existing, dict) and isinstance(value, dict):
-            # Merge nested dicts (only override the keys that are present in YAML)
-            merged = dict(existing)
-            merged.update(value)
-            setattr(cfg, key, merged)
-        else:
-            setattr(cfg, key, value)
-    return cfg
-
-
-# -----------------------------
-# Logging setup
-# -----------------------------
-def setup_logging(level: str, log_file: str = "") -> None:
-    """Configure the root *scraper* logger with a console handler and an
-    optional file handler.
-
-    Args:
-        level:    Log level string (``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``).
-        log_file: If non-empty, log messages are also written to this file.
-    """
-    numeric = getattr(logging, level.upper(), logging.INFO)
-    logger.setLevel(numeric)
-
-    fmt = logging.Formatter(
-        "[%(levelname)-8s] %(asctime)s  %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-
-    if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-        logger.info("Logging to file: %s", log_file)
+# Example detail page pattern:
+#   /company-name_ABC123
+DETAIL_PAGE_PATTERN = re.compile(r"^/[a-z0-9-]+_[A-Za-z0-9]+$")
 
 
 # -----------------------------
@@ -251,40 +151,6 @@ def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _normalize_phone(raw: str) -> str:
-    """Return a lightly cleaned phone string.
-
-    Keeps digits, ``+``, spaces, hyphens, parentheses, dots, and the letters
-    that commonly appear in extension markers (e, x, t for "ext").  Strips
-    everything else.  Empty input returns an empty string.
-    """
-    if not raw:
-        return ""
-    # Keep: digits, +, whitespace, hyphen, parentheses, dot, and letters e/x/t
-    # (individual characters in the class, not the word "ext")
-    cleaned = re.sub(r"[^\d+\s\-().ext]", "", raw, flags=re.I).strip()
-    return cleaned if re.search(r"\d{3,}", cleaned) else ""
-
-
-def _normalize_email(raw: str) -> str:
-    """Return a lowercase, stripped e-mail address or an empty string."""
-    candidate = _clean(raw).lower()
-    # Simple structural validation — must contain exactly one @
-    return candidate if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", candidate) else ""
-
-
-def _normalize_url(raw: str) -> str:
-    """Ensure a URL starts with a scheme; return an empty string if it looks invalid."""
-    url = _clean(raw)
-    if not url:
-        return ""
-    if not re.match(r"^https?://", url, re.I):
-        url = "https://" + url
-    # Very loose check — must have at least one non-special char, a literal dot,
-    # and more non-whitespace chars after (e.g. http://example.com)
-    return url if re.search(r"https?://[^\s/$.?#]+\.[^\s]+", url, re.I) else ""
-
-
 # -----------------------------
 # HTTP (detail pages)
 # -----------------------------
@@ -320,16 +186,14 @@ def fetch_html(url: str, cfg: Config) -> Optional[str]:
     Returns:
         Response body as text, or ``None`` if all retries are exhausted.
     """
-    session = _get_session(cfg.headers)
-    last_exc = None
-    for attempt in range(1, cfg.max_retries + 1):
+    last = None
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=cfg.request_timeout)
 
             if r.status_code == 429:
-                retry_after = r.headers.get("Retry-After", "")
-                wait = float(retry_after) if retry_after.isdigit() else min(2 ** attempt, 30)
-                logger.warning("Rate-limited (429) on %s — waiting %.1fs", url, wait)
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 30)
                 time.sleep(wait)
                 continue
 
@@ -343,15 +207,16 @@ def fetch_html(url: str, cfg: Config) -> Optional[str]:
                          attempt, cfg.max_retries, url, exc, backoff)
             time.sleep(backoff)
 
-    logger.error("Permanently failed: %s — %s", url, last_exc)
+    print(f"[ERROR] Failed permanently: {url} -> {last}")
     return None
 
 
 # -----------------------------
 # Listing pages (Playwright)
 # -----------------------------
-def get_listing_links_playwright(cfg: Config) -> List[str]:
-    """Collect detail-page URLs from paginated listing pages using Playwright.
+def get_listing_links_playwright(start_url: str) -> List[str]:
+    """
+    Collect detail page URLs from paginated listing pages using Playwright.
 
     Navigates pages 1 … ``cfg.max_listing_pages`` and extracts ``<a href>``
     links that match ``cfg.detail_page_pattern``.  Stops early when a page
@@ -370,35 +235,34 @@ def get_listing_links_playwright(cfg: Config) -> List[str]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.set_default_timeout(30_000)
+        page.set_default_timeout(30000)
 
-        for i in range(1, cfg.max_listing_pages + 1):
-            url = cfg.start_url if i == 1 else f"{cfg.start_url}/{i}"
-            logger.info("[LIST] Page %d — loading %s", i, url)
+        for i in range(1, MAX_LISTING_PAGES + 1):
+            url = start_url if i == 1 else f"{start_url}/{i}"
+            print(f"[LIST] Loading {url}")
 
             page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(cfg.playwright_wait_ms)
+            page.wait_for_timeout(800)
 
-            soup = make_soup(page.content())
-            page_links: List[str] = []
+                soup = make_soup(html)
+                page_links: List[str] = []
 
             for a in soup.select("a[href]"):
                 href = (a.get("href") or "").strip()
-                if pattern.match(href):
-                    page_links.append(urljoin(cfg.base_url, href))
+                if DETAIL_PAGE_PATTERN.match(href):
+                    page_links.append(urljoin(BASE_URL, href))
 
-            # de-dupe while preserving order
-            page_links = list(dict.fromkeys(page_links))
+                page_links = list(dict.fromkeys(page_links))
 
             if not page_links:
-                logger.info("[LIST] No links found on page %d — stopping", i)
                 break
 
-            new = [u for u in page_links if u not in seen]
-            seen.update(new)
-            links.extend(new)
+            for u in page_links:
+                if u not in seen:
+                    seen.add(u)
+                    links.append(u)
 
-            logger.info("[LIST] Page %d: +%d new links (total: %d)", i, len(new), len(links))
+            print(f"[LIST] Page {i}: total links {len(links)}")
 
         browser.close()
 
@@ -432,7 +296,23 @@ def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
         cfg:  Active :class:`Config` (used for ``base_url`` and selectors).
 
     Returns:
-        Populated :class:`ListingEntry` with a UTC ``scraped_at`` timestamp.
+        ListingEntry: A populated entry containing:
+            - url: The input URL.
+            - name: Text from the first <h1> element (cleaned), or empty string.
+            - address: Heuristically detected street + postal/city line from page text,
+              formatted as "line_i, line_{i+1}" (cleaned), or empty string.
+            - phone: Value from the first <a href="tel:..."> (cleaned), or empty string.
+            - email: Value from the first <a href="mailto:..."> (cleaned), or empty string.
+            - website: First external absolute link (href starts with "http" and does not
+              contain BASE_URL), or empty string.
+    Notes:
+        - Uses BeautifulSoup via make_soup() to parse the HTML.
+        - Address detection scans consecutive text lines; it looks for a digit in the first
+          line and a following line matching r"^\\d{4,5}\\s+\\S+" (e.g., postal code + city).
+        - Only the first matching external website link is returned.
+    Raises:
+        Any exceptions raised by make_soup(), BeautifulSoup accessors, or regular expression
+        operations will propagate.
     """
     soup = make_soup(html)
     sel = cfg.field_selectors
@@ -443,8 +323,10 @@ def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
 
     # ── email ─────────────────────────────────────────────────────────────────
     email = ""
-    email_sel = sel.get("email") or "a[href^='mailto:']"
-    a_mail = soup.select_one(email_sel)
+    phone = ""
+    website = ""
+
+    a_mail = soup.select_one("a[href^='mailto:']")
     if a_mail:
         raw = (a_mail.get("href") or "").replace("mailto:", "")
         email = _normalize_email(raw)
@@ -454,20 +336,17 @@ def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
     phone_sel = sel.get("phone") or "a[href^='tel:']"
     a_tel = soup.select_one(phone_sel)
     if a_tel:
-        raw = (a_tel.get("href") or "").replace("tel:", "")
-        phone = _normalize_phone(raw)
+        phone = _clean(a_tel["href"].replace("tel:", ""))
 
-    # ── website ───────────────────────────────────────────────────────────────
-    website = ""
-    website_sel = sel.get("website") or "a[href^='http']"
-    for a in soup.select(website_sel):
-        href = (a.get("href") or "").strip()
-        if href.startswith("http") and cfg.base_url not in href:
-            website = _normalize_url(href)
-            if website:
-                break
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if href.startswith("http") and BASE_URL not in href:
+            website = href
+            break
 
-    # ── address ───────────────────────────────────────────────────────────────
+    text = soup.get_text("\n", strip=True)
+    lines = [l for l in text.splitlines() if l.strip()]
+
     address = ""
     address_sel = sel.get("address") or ""
     if address_sel:
@@ -493,109 +372,10 @@ def parse_listing_html(url: str, html: str, cfg: Config) -> ListingEntry:
     )
 
 
-def fetch_and_parse_listing(url: str, cfg: Config) -> Optional[ListingEntry]:
-    """Fetch *url* and return a parsed :class:`ListingEntry`, or ``None`` on error."""
-    html = fetch_html(url, cfg)
-    _sleep(cfg.sleep_detail_min, cfg.sleep_detail_max)
-    if not html:
-        return None
-    entry = parse_listing_html(url, html, cfg)
-    if cfg.enrich_missing_data:
-        entry = enrich_entry(entry, cfg)
-    logger.debug("Parsed: %s — %s (quality: %d%%)", entry.name, url, entry.data_quality)
-    return entry
-
-
-# -----------------------------
-# Optional web-search enrichment
-# -----------------------------
-def _ddg_search(query: str, cfg: Config) -> str:
-    """Query the DuckDuckGo Instant Answer API and return the best text snippet.
-
-    Uses the free, no-key-required ``/`` JSON endpoint.  Returns an empty
-    string when the API call fails or returns nothing useful.
-
-    Args:
-        query: Free-text search query.
-        cfg:   Active :class:`Config` (for HTTP settings).
-
-    Returns:
-        The ``AbstractText`` or ``Answer`` from the DuckDuckGo response, or
-        an empty string.
-    """
-    url = (
-        "https://api.duckduckgo.com/?"
-        f"q={urlquote(query, safe='')}&format=json&no_html=1&skip_disambig=1"
-    )
-    raw = fetch_html(url, cfg)
-    if not raw:
-        return ""
-    try:
-        data = json.loads(raw)
-        return data.get("AbstractText") or data.get("Answer") or ""
-    except (json.JSONDecodeError, AttributeError):
-        return ""
-
-
-def enrich_entry(entry: ListingEntry, cfg: Config) -> ListingEntry:
-    """Attempt to fill missing contact fields via a DuckDuckGo web search.
-
-    Only runs when ``cfg.enrich_missing_data`` is ``True`` and the entry has
-    a name.  Only missing fields are searched for — already-populated fields
-    are never overwritten.
-
-    Args:
-        entry: The :class:`ListingEntry` to enrich (modified in place).
-        cfg:   Active :class:`Config`.
-
-    Returns:
-        The (possibly updated) :class:`ListingEntry`.
-    """
-    if not entry.name:
-        return entry
-
-    missing = [f for f in ("phone", "email", "website") if not getattr(entry, f)]
-    if not missing:
-        return entry
-
-    query = f"{entry.name} {entry.address or ''} {' '.join(missing)} contact".strip()
-    snippet = _ddg_search(query, cfg)
-    if not snippet:
-        logger.debug("Enrichment: no DDG result for '%s'", entry.name)
-        return entry
-
-    changed = False
-
-    if not entry.phone:
-        m = re.search(r"(?:phone|tel)[:\s]*(\+?[\d][\d\s\-().]{5,18}\d)", snippet, re.I)
-        if m:
-            candidate = _normalize_phone(m.group(1))
-            if candidate:
-                entry.phone = candidate
-                changed = True
-
-    if not entry.email:
-        # Extract candidate with a broad pattern, then validate via _normalize_email
-        m = re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", snippet)
-        if m:
-            candidate = _normalize_email(m.group(0))
-            if candidate:
-                entry.email = candidate
-                changed = True
-
-    if not entry.website:
-        m = re.search(r"https?://[^\s<>\"']+", snippet)
-        if m:
-            candidate = _normalize_url(m.group(0))
-            if candidate and cfg.base_url not in candidate:
-                entry.website = candidate
-                changed = True
-
-    if changed:
-        entry.enriched = True
-        logger.debug("Enrichment: filled fields for '%s'", entry.name)
-
-    return entry
+def fetch_and_parse_listing(url: str) -> Optional[ListingEntry]:
+    html = fetch_html(url)
+    _sleep(SLEEP_DETAIL)
+    return parse_listing_html(url, html) if html else None
 
 
 # -----------------------------
@@ -699,6 +479,18 @@ def save_csv(entries: List[ListingEntry], path: str) -> None:
     logger.info("CSV saved: %s (%d rows)", path, len(entries))
 
 
+def autosize_columns(ws, cap: int = 60) -> None:
+    """Best-effort column width sizing based on observed content length."""
+    for col_idx, _ in enumerate(XLSX_HEADERS, start=1):
+        letter = get_column_letter(col_idx)
+        max_len = max(
+            (len(str(ws.cell(row=r, column=col_idx).value or ""))
+             for r in range(1, ws.max_row + 1)),
+            default=10,
+        )
+        ws.column_dimensions[letter].width = min(max_len + 2, cap)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -760,56 +552,33 @@ def main() -> None:
     lock = threading.Lock()
 
     done_urls = read_done_urls(ws)
-    logger.info("Resume: %d entries already saved", len(done_urls))
+    print(f"[INFO] Resume enabled ({len(done_urls)} entries already saved)")
 
     links = get_listing_links_playwright(cfg)
     todo = [u for u in links if u not in done_urls]
-    logger.info("Listings discovered: %d total, %d pending", len(links), len(todo))
 
-    if not todo:
-        logger.info("Nothing to do — all listings already scraped.")
-        return
+    with ThreadPoolExecutor(max_workers=HTTP_THREADS) as pool:
+        futures = [pool.submit(fetch_and_parse_listing, url) for url in todo]
 
-    completed = 0
-    total = len(todo)
-    csv_entries: List[ListingEntry] = []
-
-    with ThreadPoolExecutor(max_workers=cfg.http_threads) as pool:
-        futures = {pool.submit(fetch_and_parse_listing, url, cfg): url
-                   for url in todo}
-
-        for future in as_completed(futures):
-            completed += 1
-            row = future.result()
+        for i, f in enumerate(as_completed(futures), 1):
+            row = f.result()
             if not row:
-                logger.warning("[%d/%d] Failed: %s", completed, total, futures[future])
                 continue
 
             with lock:
                 append_row(ws, row)
-                if cfg.output_csv:
-                    csv_entries.append(row)
 
-            enriched_tag = " [enriched]" if row.enriched else ""
-            logger.info(
-                "[%d/%d] Saved: %s  quality=%d%%%s",
-                completed, total,
-                row.name or futures[future],
-                row.data_quality,
-                enriched_tag,
-            )
+            if i % 25 == 0:
+                wb.save(OUTPUT_XLSX)
 
-            if completed % 25 == 0:
-                with lock:
-                    wb.save(cfg.output_xlsx)
-                logger.debug("Progress checkpoint saved (%d rows)", completed)
-
-    wb.save(cfg.output_xlsx)
-    logger.info("Done — %d listings written to %s", completed, cfg.output_xlsx)
-
-    if cfg.output_csv and csv_entries:
-        save_csv(csv_entries, cfg.output_csv)
+    wb.save(OUTPUT_XLSX)
+    print(f"[DONE] Finished. Output: {OUTPUT_XLSX}")
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        main()
+    except Exception as e:
+        log.exception("Fatal error: %s", e)
+        sys.exit(1)
